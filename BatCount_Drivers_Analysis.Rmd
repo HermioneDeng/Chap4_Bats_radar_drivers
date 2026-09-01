@@ -1,0 +1,354 @@
+---
+title: "BatCount_Drivers_Analysis"
+author: "Yuting Deng"
+date: "2026-08-18"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mgcv)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+```
+
+# Data wrangling
+
+```{r}
+combined_df <- read_csv("./Data/10_count_env_df.csv")
+
+df <- combined_df |> 
+  mutate(
+    wind_speed.night = sqrt(uwind.10m.night^2 + vwind.10m.night^2),
+    colony = as.factor(colony),
+    year = as.factor(year),
+    roost_type = as.factor(roost_type),
+    local_date = as.Date(local_date)
+  ) |> 
+  
+  # --- Collapse multiple per-night tracks into one row per colony-night ---
+  # track_90q_count and track_count_se are recalculated, allowing only one per colony-night
+  # adjusted_VIC is the raw per-track value
+  # (potentially) multiple tracks exist per night per cplony, currently considered as one.
+  group_by(colony, local_date) |> 
+  summarise(
+    track_90q_count = quantile(adjusted_VIC, 0.90, na.rm = TRUE),
+    track_count_se  = sd(adjusted_VIC, na.rm = TRUE) / sqrt(n()),
+    n_tracks        = n(),                     # keep this — useful diagnostic, see note below
+    
+    # Environmental covariates should be constant within a colony-night;
+    # take the first value per group, but see the warning below.
+    across(
+      c(ctr_lon, ctr_lat, year, roost_type, yday,
+        air.2m.night, air.2m.night.diff, wind_speed.night, prate.night,
+        rhum.2m.night, pres.sfc.night, tcdc.night, lunar.illumination,
+        avg_drought_index, dist),
+      ~ first(.x)
+    ),
+    .groups = "drop"
+  ) 
+
+# rebuild series_id for the ar() grouping using AR.start blocks rather than calendar year (since a colony's monitoring can have gaps that calendar year doesn't capture)
+```
+
+## Verify the environmental covariates really are constant per colony-night.
+
+```{r}
+df |> 
+  group_by(colony, local_date) |> 
+  summarise(n_distinct_temp = n_distinct(wind_speed.night), .groups = "drop") |> 
+  filter(n_distinct_temp > 1)
+
+hist(df$n_tracks)
+```
+
+Addtionally (not done yet), I could consider whether n_tracks (how many radar tracks contributed to each night's 90th percentile) should enter the model. A 90th percentile computed from 3 tracks is a much noisier estimate of "true" nightly emergence intensity than one computed from 50 tracks. This is exactly what track_count_se was meant to capture, but I could also:
+
+- Filter out very low-n_tracks nights if they're likely unreliable (e.g., n_tracks \< 5), or
+
+- Weight the model by track_count_se (e.g., via weights = 1/track_count_se\^2 in bam, or as a measurement-error model in brms) rather than treating every night's response as equally precise.
+
+## Averaged pair-wise distance between all roosts
+
+```{r}
+df_colony = df |> select(colony, ctr_lon, ctr_lat, roost_type) |> unique()
+mean(dist(df_colony[, c("ctr_lon", "ctr_lat")])) / 1000
+```
+
+## The 3-Day Rolling Average
+
+Test compensatory foraging: bats "penned up" by bad weather will emerge in much higher intensity on subsequent nights.
+
+```{r}
+library(slider)
+library(lubridate)
+
+track_df <- df |> 
+  select(colony, ctr_lon, ctr_lat, local_date, year, yday, 
+         track_90q_count, track_count_se, n_tracks,
+         air.2m.night, air.2m.night.diff, wind_speed.night, 
+         prate.night, rhum.2m.night, pres.sfc.night, tcdc.night, 
+         lunar.illumination, avg_drought_index, roost_type, dist) |> 
+  
+  # --- 3-day rolling average of PRIOR emergence (compensatory foraging test) ---
+  group_by(colony) |> 
+  arrange(local_date) |> 
+  mutate(
+    avg_3day_prior = slide_index_dbl(
+      .x = track_90q_count,
+      .i = local_date,
+      .f = mean,
+      na.rm = TRUE,
+      .before = days(2),
+      .after  = days(-1)   # excludes current night; window = t-3 to t-1
+    )
+  ) |> 
+  ungroup() |> 
+  
+  # Drop rows without enough history for the lag
+  filter(!is.na(avg_3day_prior), !is.nan(avg_3day_prior)) |> 
+  
+  # --- Recompute AR structure on the FILTERED series ---
+  # This must happen after filtering, since dropped rows change where each
+  # colony's usable series actually begins and where gaps now fall.
+  arrange(colony, local_date) |> 
+  group_by(colony) |> 
+  mutate(
+    time_diff = as.numeric(difftime(local_date, lag(local_date), units = "days")),
+    AR.start  = ifelse(is.na(time_diff) | time_diff > 1, TRUE, FALSE),
+    bout_id   = cumsum(AR.start)
+  ) |> 
+  ungroup() |> 
+  mutate(series_id = interaction(colony, bout_id, drop = TRUE))
+```
+
+Replaced the year/yday-based series_id at the bottom with the AR.start/bout_id approach from before, computed fresh on the filtered data using local_date (real calendar time) rather than yday (which resets every Jan 1 and would incorrectly treat Dec 31 → Jan 1 as a huge "gap" even if monitoring was continuous, or wrongly link two unrelated Jan-1-adjacent nights across different years).
+
+## Check for Duplications
+
+```{r}
+dupes <- track_df %>%
+  group_by(series_id, yday) %>%
+  filter(n() > 1) %>%
+  arrange(series_id, yday)
+
+nrow(dupes)
+head(dupes, 20)
+
+# how many series affected, and what's the max duplication?
+dupes %>% group_by(series_id) %>% summarise(n_dup_days = n_distinct(yday)) %>% arrange(desc(n_dup_days))
+
+df |> filter(colony == "Bracken Cave" & year == "2006" & yday == 35) |> View()
+
+# Confirm one row per colony-night, still true after this pipeline
+track_df |> count(colony, local_date) |> filter(n > 1) |> nrow()  # should be 0
+
+# Check how much data the 3-day lag requirement cost you
+nrow(df) - nrow(track_df)
+
+# Distribution of bout lengths — are most series long enough for AR(1) to matter?
+track_df |> count(series_id) |> summarise(median_len = median(n), min_len = min(n), max_len = max(n))
+
+# Spot-check the rolling average makes sense for one colony
+track_df |> filter(colony == first(colony)) |> 
+  select(local_date, track_90q_count, avg_3day_prior) |> 
+  head(10)
+```
+
+## Variables and hypothesis
+
+- avg_3day_prior (Behavioral momentum / Compensatory foraging)
+
+- air.2m.night (Thermal constraint)
+
+- air.2m.night.diff (Relative temperature change as a phenological trigger)
+
+- wind_speed.night (Flight aerodynamic cost)
+
+- prate.night (Direct flight impairment)
+
+- rhum.2m.night (Often tied to insect abundance)
+
+- pres.sfc.night (Barometric pressure changes often cue insect hatches and bat activity)
+
+- tcdc.night (Cloud cover)
+
+- lunar.illumination (Predator avoidance / visual acuity)
+
+- avg_drought_index (Long-term habitat/prey productivity constraint)
+
+# Bayesian mixed-effects analysis
+
+```{r}
+library(brms)
+
+bf_model <- bf(
+  log(track_90q_count) ~
+    roost_type +
+    s(avg_3day_prior) +
+    s(air.2m.night) +
+    s(air.2m.night.diff) +
+    s(wind_speed.night, k = 12) +
+    s(rhum.2m.night) +
+    s(pres.sfc.night) +
+    s(tcdc.night) +
+    s(lunar.illumination, k = 15) +
+    s(avg_drought_index) +
+    s(yday, bs = "cc") +
+    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) +
+    s(dist) +
+    (1 | colony) +
+    (1 | year) +
+    ar(time = local_date, gr = series_id, p = 1)
+)
+
+# Check what priors brms expects for this formula before fitting
+get_prior(bf_model, data = track_df, family = gaussian())
+
+priors <- c(
+  prior(normal(0, 5), class = "b"),                 # fixed effects (roost_type)
+  prior(student_t(3, 0, 2.5), class = "sds"),        # smooth term wiggliness (all s() terms)
+  prior(student_t(3, 0, 2.5), class = "sd"),         # colony/year random intercept SDs
+  prior(normal(0, 0.3), class = "ar"),               # AR(1) coefficient — you already know it's small (~0.06)
+  prior(student_t(3, 0, 2.5), class = "sigma")       # residual SD
+)
+
+```
+
+```{r}
+fit <- brm(
+  bf_model,
+  data = track_df,
+  family = gaussian(),
+  prior = priors,
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  warmup = 1000,
+  backend = "cmdstanr",     # substantially faster than rstan for this size
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  seed = 123
+)
+```
+
+Diagnostics and model checking
+
+```{r}
+# Convergence
+summary(fit)              # check Rhat ~1.00, adequate Bulk_ESS/Tail_ESS
+plot(fit)                 # trace plots for key parameters
+
+# Posterior predictive check — does simulated data resemble observed?
+pp_check(fit, ndraws = 100)
+
+# Smooth term visualization with credible intervals
+conditional_smooths(fit)
+
+# AR(1) coefficient posterior — compare to BAM point estimate of 0.063
+posterior_summary(fit, variable = "ar[1]")
+
+# Model comparison (e.g., with vs without AR term) via LOO
+fit_no_ar <- update(fit, formula. = bf_model_without_ar, ...)
+loo(fit, fit_no_ar)
+```
+
+# BAM
+
+```{r}
+# 1. Order data properly for AR structure: within colony-year time series
+track_df <- track_df[order(track_df$colony, track_df$year, track_df$yday), ]
+
+# 2. Mark the start of each colony-year series (bam's rho resets here)
+track_df$series_id <- interaction(track_df$colony, track_df$year, drop = TRUE)
+track_df$AR.start <- !duplicated(track_df$series_id)
+
+# 3. Fit an initial model WITHOUT rho to estimate the AR1 coefficient from residuals
+m0 <- bam(
+  log(track_90q_count) ~ 
+    roost_type +
+    s(avg_3day_prior) + s(air.2m.night) + s(air.2m.night.diff) +
+    s(wind_speed.night) + s(prate.night) + s(rhum.2m.night) +
+    s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination) +
+    s(avg_drought_index) +
+    s(yday, bs = "cc") +
+    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) +  # colony-specific phenology
+    s(dist) +
+    s(colony, bs = "re") +
+    s(year, bs = "re"),
+  data = track_df,
+  method = "fREML",
+  select = TRUE,
+  discrete = TRUE,
+  nthreads = 4
+)
+
+# 4. Estimate rho from lag-1 autocorrelation of residuals, within series only
+r0 <- residuals(m0)
+rho_est <- acf(r0, plot = FALSE)$acf[2]   # crude global estimate; see note below
+rho_est
+
+library(dplyr)
+rho_by_series <- track_df %>%
+  mutate(resid = r0) %>%
+  group_by(series_id) %>%
+  filter(n() > 5) %>%
+  summarise(rho1 = acf(resid, plot = FALSE, lag.max = 1)$acf[2]) %>%
+  pull(rho1)
+
+rho_est <- mean(rho_by_series, na.rm = TRUE)
+rho_est
+```
+
+```{r}
+m_ar <- bam(
+  log(track_90q_count) ~ 
+    roost_type +
+    s(avg_3day_prior) + s(air.2m.night) + s(air.2m.night.diff) +
+    s(wind_speed.night) + s(prate.night) + s(rhum.2m.night) +
+    s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination) +
+    s(avg_drought_index) +
+    s(yday, bs = "cc") +
+    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) +
+    s(dist) +
+    s(colony, bs = "re") +
+    s(year, bs = "re"),
+  data = track_df,
+  method = "fREML",
+  select = TRUE,
+  discrete = TRUE,
+  rho = rho_est,
+  AR.start = track_df$AR.start,
+  nthreads = 4
+)
+
+summary(m_ar)
+
+# itsadug is built for exactly this diagnostic on bam AR models
+library(itsadug)
+acf_resid(m_ar)   # should show near-zero autocorrelation at lag 1+ now
+```
+
+```{r}
+colony_resid <- aggregate(residuals(m_ar) ~ colony, data = track_df, FUN = mean)
+coords <- unique(track_df[, c("colony","ctr_lon","ctr_lat")])
+colony_resid <- merge(colony_resid, coords, by = "colony")
+
+library(ape)
+dist_mat <- as.matrix(dist(colony_resid[, c("ctr_lon","ctr_lat")]))
+inv_dist <- 1 / dist_mat
+diag(inv_dist) <- 0
+Moran.I(colony_resid$`residuals(m_ar)`, inv_dist)
+```
+
+```{r}
+concurvity(m_ar, full = TRUE)
+```
+
+```{r}
+gam.check(m_ar)
+```
+
+# 
