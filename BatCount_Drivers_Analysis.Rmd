@@ -34,6 +34,7 @@ df <- combined_df |>
   # adjusted_VIC is the raw per-track value
   # (potentially) multiple tracks exist per night per cplony, currently considered as one.
   group_by(colony, local_date) |> 
+  arrange(from_sunset) |> 
   summarise(
     track_90q_count = quantile(adjusted_VIC, 0.90, na.rm = TRUE),
     track_count_se  = sd(adjusted_VIC, na.rm = TRUE) / sqrt(n()),
@@ -42,10 +43,11 @@ df <- combined_df |>
     # Environmental covariates should be constant within a colony-night;
     # take the first value per group, but see the warning below.
     across(
-      c(ctr_lon, ctr_lat, year, roost_type, yday,
-        air.2m.night, air.2m.night.diff, wind_speed.night, prate.night,
+      c(ctr_lon, ctr_lat, year, yday,
+        air.2m.night, air.2m.night.diff, wind_speed.night, 
+        prate.night, avg_drought_index,
         rhum.2m.night, pres.sfc.night, tcdc.night, lunar.illumination,
-        avg_drought_index, dist),
+        from_sunset, dist, roost_type),
       ~ first(.x)
     ),
     .groups = "drop"
@@ -67,9 +69,9 @@ hist(df$n_tracks)
 
 Addtionally (not done yet), I could consider whether n_tracks (how many radar tracks contributed to each night's 90th percentile) should enter the model. A 90th percentile computed from 3 tracks is a much noisier estimate of "true" nightly emergence intensity than one computed from 50 tracks. This is exactly what track_count_se was meant to capture, but I could also:
 
-- Filter out very low-n_tracks nights if they're likely unreliable (e.g., n_tracks \< 5), or
+-   Filter out very low-n_tracks nights if they're likely unreliable (e.g., n_tracks \< 5), or
 
-- Weight the model by track_count_se (e.g., via weights = 1/track_count_se\^2 in bam, or as a measurement-error model in brms) rather than treating every night's response as equally precise.
+-   Weight the model by track_count_se (e.g., via weights = 1/track_count_se\^2 in bam, or as a measurement-error model in brms) rather than treating every night's response as equally precise.
 
 ## Averaged pair-wise distance between all roosts
 
@@ -87,12 +89,6 @@ library(slider)
 library(lubridate)
 
 track_df <- df |> 
-  select(colony, ctr_lon, ctr_lat, local_date, year, yday, 
-         track_90q_count, track_count_se, n_tracks,
-         air.2m.night, air.2m.night.diff, wind_speed.night, 
-         prate.night, rhum.2m.night, pres.sfc.night, tcdc.night, 
-         lunar.illumination, avg_drought_index, roost_type, dist) |> 
-  
   # --- 3-day rolling average of PRIOR emergence (compensatory foraging test) ---
   group_by(colony) |> 
   arrange(local_date) |> 
@@ -123,6 +119,14 @@ track_df <- df |>
   ) |> 
   ungroup() |> 
   mutate(series_id = interaction(colony, bout_id, drop = TRUE))
+
+track_df <- track_df |>
+  arrange(colony, local_date) |>
+  group_by(colony) |>
+  mutate(
+    prate.night.diff = prate.night - lag(prate.night)   # change in precip, not raw lag
+  ) |>
+  ungroup()
 ```
 
 Replaced the year/yday-based series_id at the bottom with the AR.start/bout_id approach from before, computed fresh on the filtered data using local_date (real calendar time) rather than yday (which resets every Jan 1 and would incorrectly treat Dec 31 → Jan 1 as a huge "gap" even if monitoring was continuous, or wrongly link two unrelated Jan-1-adjacent nights across different years).
@@ -158,48 +162,118 @@ track_df |> filter(colony == first(colony)) |>
   head(10)
 ```
 
+Check for correlations and concurvity
+
+```{r}
+# Quick linear correlation as a first pass (won't catch nonlinear concurvity, but fast)
+cor(track_df$rhum.2m.night, track_df$prate.night, use = "complete.obs")
+cor(track_df$rhum.2m.night, track_df$prate.night.diff, use = "complete.obs")
+cor(track_df$prate.night, track_df$avg_3day_prior, use = "complete.obs")
+
+quick_check <- bam(
+  log(track_90q_count) ~ s(rhum.2m.night) + s(prate.night) + s(prate.night.diff) + s(pres.sfc.night),
+  data = track_df, method = "fREML", discrete = TRUE
+)
+concurvity(quick_check, full = FALSE)
+
+resid_model <- bam(rhum.2m.night ~ s(prate.night), data = track_df, method = "fREML")
+track_df$rhum_resid <- residuals(resid_model)
+
+quick_check <- bam(
+  log(track_90q_count) ~ s(avg_3day_prior) + s(air.2m.night) + s(air.2m.night.diff) +
+    s(wind_speed.night) + 
+    s(rhum_resid) + s(pres.sfc.night) + s(prate.night) + 
+    s(tcdc.night) + s(lunar.illumination) + s(avg_drought_index) + 
+    roost_type + s(from_sunset) + s(dist),
+  data = track_df, method = "fREML", discrete = TRUE
+)
+concurvity(quick_check, full = TRUE) # HIGH Concurvity, drop prate.night.diff
+
+resid_model <- bam(avg_3day_prior ~ s(prate.night), data = track_df, method = "fREML")
+summary(resid_model) # Because both avg_3day_prior & prate.night are heavily skewed (one with millions of zeros, one with extreme values out to $5\times 10^6$), both basis expansions struggle to separate cleanly from the global intercept (para). Because both smooths overlap with the intercept space, they transitively show high mathematical overlap with each other.
+```
+
+```{r}
+write_csv(track_df, "./Data/track_df.csv")
+```
+
 ## Variables and hypothesis
 
-- avg_3day_prior (Behavioral momentum / Compensatory foraging)
+-   avg_3day_prior (Behavioral momentum / Compensatory foraging)
 
-- air.2m.night (Thermal constraint)
+-   air.2m.night (Thermal constraint)
 
-- air.2m.night.diff (Relative temperature change as a phenological trigger)
+-   air.2m.night.diff (Relative temperature change as a phenological trigger)
 
-- wind_speed.night (Flight aerodynamic cost)
+-   wind_speed.night (Flight aerodynamic cost)
 
-- prate.night (Direct flight impairment)
+-   prate.night (Direct flight impairment)
 
-- rhum.2m.night (Often tied to insect abundance)
+-   rhum.2m.night (Often tied to insect abundance)
 
-- pres.sfc.night (Barometric pressure changes often cue insect hatches and bat activity)
+-   pres.sfc.night (Barometric pressure changes often cue insect hatches and bat activity)
 
-- tcdc.night (Cloud cover)
+-   tcdc.night (Cloud cover)
 
-- lunar.illumination (Predator avoidance / visual acuity)
+-   lunar.illumination (Predator avoidance / visual acuity)
 
-- avg_drought_index (Long-term habitat/prey productivity constraint)
+-   avg_drought_index (Long-term habitat/prey productivity constraint)
 
 # Bayesian mixed-effects analysis
+
+The comparison set
+
+1.  Baseline: no AR, no factor-smooth — tests whether the temporal/colony-phenology structure is worth the computational cost at all
+2.  AR(1), no factor-smooth — isolates the effect of the AR term alone
+3.  factor-smooth, no AR — isolates the effect of colony-specific phenology alone
+4.  Your full model (both AR + factor-smooth) — coded below
+5.  colony size, + targeted interactions — the "performance-chasing" version, built once you know which interactions RF flags (from your earlier plan)
+6.  Simplified colony-slope alternative to the factor-smooth — worth testing since s(yday,colony,bs="fs") is by far your most expensive term (371 basis functions in the frequentist fit); a random-slope version is much cheaper and might capture almost as much
+
+Distributional family alternatives
+
+Worth testing at least one alongside the family sweep, since log(y) \~ gaussian is a pragmatic default, not a verified-best choice:
+
+-   gaussian() on log(y) — what you have now
+
+-   Gamma(link = "log") on raw track_90q_count — often more appropriate for strictly-positive, right-skewed count-like data than log-transform + gaussian, and avoids the (common but easy-to-miss) issue that log(y) \~ N implicitly assumes multiplicative log-normal errors, which may not match your residual distribution
+
+-   brms::negbinomial() on raw counts — closest to what you already did for the colony-trend models, appropriate if track_90q_count is still meaningfully integer-like (a 90th-percentile of detection counts might be) rather than continuous
+
+Run order (given compute cost)
+
+1.  Fit models 1, 2, 3 (base, +AR, +factor-smooth) first — cheapest, and this tells you whether AR and/or factor-smooth are worth their cost at all, using loo_compare() as an approximate first pass.
+
+2.  Fit model 6 (random slope) as a cheaper alternative to the factor-smooth — compare against model 3/4 to see how much you lose by simplifying.
+
+3.  Once you know which structural pieces matter, fit the family sweep (Gamma, negbinomial) only on your best structural formula, comparing via CV RMSE on the raw scale.
+
+4.  Only then invest in model 5 (interactions + colony size) informed by the RF exploration step, since it's the most expensive and most complexity-adding version — you want to know the cheaper pieces are justified before stacking more on top.
+
+This ordering also gives you a natural table for your methods/results section: a nested model comparison showing which components (AR, colony-phenology, interactions, distributional family) each contributed to fit, rather than presenting only the final "kitchen sink" model with no justification for its complexity.
 
 ```{r}
 library(brms)
 
+track_df = read_csv("./Data/track_df.csv")
+
 bf_model <- bf(
   log(track_90q_count) ~
-    roost_type +
-    s(avg_3day_prior) +
     s(air.2m.night) +
     s(air.2m.night.diff) +
     s(wind_speed.night, k = 12) +
-    s(rhum.2m.night) +
+    s(prate.night)+
+    s(rhum_resid) +
     s(pres.sfc.night) +
     s(tcdc.night) +
     s(lunar.illumination, k = 15) +
     s(avg_drought_index) +
+    roost_type +
+    s(dist) +
+    s(from_sunset) +
+    s(avg_3day_prior) +
     s(yday, bs = "cc") +
     s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) +
-    s(dist) +
     (1 | colony) +
     (1 | year) +
     ar(time = local_date, gr = series_id, p = 1)
@@ -219,6 +293,10 @@ priors <- c(
 ```
 
 ```{r}
+library(cmdstanr)
+# Ensure output directory exists
+dir.create("./Models/csvs", showWarnings = FALSE, recursive = TRUE)
+
 fit <- brm(
   bf_model,
   data = track_df,
@@ -230,7 +308,8 @@ fit <- brm(
   warmup = 1000,
   backend = "cmdstanr",     # substantially faster than rstan for this size
   control = list(adapt_delta = 0.95, max_treedepth = 12),
-  seed = 123
+  seed = 123,
+  output_dir = "./Models/csvs"  # <-- Saves raw chain CSVs here permanently
 )
 ```
 
@@ -251,8 +330,367 @@ conditional_smooths(fit)
 posterior_summary(fit, variable = "ar[1]")
 
 # Model comparison (e.g., with vs without AR term) via LOO
-fit_no_ar <- update(fit, formula. = bf_model_without_ar, ...)
+# fit_no_ar <- update(fit, formula. = bf_model_without_ar, ...)
 loo(fit, fit_no_ar)
+```
+
+## Compare models
+
+Standard loo() is compromised here because of the ar() term — PSIS-LOO assumes exchangeable observations, but with an AR(1) structure, leaving out a single time point conditional on its neighbors isn't a well-posed leave-one-out problem in the usual sense (brms will warn about this, or pareto_k diagnostics may look unreliable specifically in the presence of autocor() terms). Options:
+
+1.  loo() anyway, but treat results as approximate/exploratory — useful for the non-AR comparisons (models 1, 3, 6-without-ar) and as a rough signal for the AR models, but don't over-interpret small ELPD differences for anything with ar():
+
+```{r}
+library(loo)
+fit_base <- readRDS("./Models/base.rds")
+fit_ar   <- readRDS("./Models/ar_only.rds")
+fit_fs   <- readRDS("./Models/fs_only.rds")
+fit_full <- readRDS("./Models/fs_ar.rds")
+fit_fs_ar_interact = readRDS("./Models/fs_ar_interact.rds")
+fit_ranslope_ar = readRDS("./Models/ranslope_ar.rds")
+
+loo_base <- loo(fit_base)
+loo_ar   <- loo(fit_ar)
+loo_fs   <- loo(fit_fs)
+loo_full <- loo(fit_full)
+loo_fs_ar_interact = loo(fit_fs_ar_interact)
+loo_ranslope = loo(fit_ranslope_ar)
+
+loo_compare(loo_base, loo_ar, loo_fs, loo_full, loo_fs_ar_interact, loo_ranslope)
+
+saveRDS(loo_base, "./Models/loo_base.rds")
+saveRDS(loo_fs, "./Models/loo_fs.rds")
+saveRDS(loo_ar, "./Models/loo_ar.rds")
+saveRDS(loo_full, "./Models/loo_full.rds")
+saveRDS(loo_fs_ar_interact, "./Models/loo_fs_ar_interact.rds")
+saveRDS(loo_ranslope, "./Models/loo_ranslope.rds")
+```
+
+A pareto_k \> 0.7 means PSIS-LOO's importance sampling approximation is unreliable for that specific observation in fit_fs and fit_full — the elpd contribution from that one point could be biased, which could specifically affect exactly the comparison you care about (full vs. fs).
+
+blocked/grouped k-fold CV — hold out entire series_id blocks (whole colony-seasons) rather than individual nights, so temporal dependency within a held-out block stays intact and prediction is genuinely out-of-sample:
+
+```{r}
+library(brms)
+library(dplyr)
+
+# --- Fix 1: convert local_date to numeric BEFORE fitting, avoids Date-class
+# metadata mismatches in ar() validation entirely ---
+track_df <- track_df |>
+  mutate(local_date_num = as.numeric(local_date))  # days since epoch, numeric
+
+# Refit your candidate models using local_date_num in ar(), e.g.:
+# ar(time = local_date_num, gr = series_id, p = 1)
+# (If you don't want to refit fit_full/fit_fs_ar_interact from scratch, you can 
+#  likely get away with just using local_date_num for the CV refits below, since 
+#  what matters for THIS check is that newdata construction stays consistent.)
+
+# --- Manual grouped K-fold ---
+set.seed(123)
+series_ids <- unique(track_df$series_id)
+K <- 5   # reduced from 10 — cuts total compute roughly in half; consider even 
+         # fewer folds given the runtime you're seeing
+folds <- sample(rep(1:K, length.out = length(series_ids)))
+fold_map <- setNames(folds, series_ids)
+track_df$fold <- fold_map[as.character(track_df$series_id)]
+
+# Storage for results
+cv_results <- vector("list", K)
+
+for (k in 1:K) {
+  cat("=== Fold", k, "of", K, "===\n")
+  
+  train_k <- track_df |> filter(fold != k)
+  test_k  <- track_df |> filter(fold == k)
+  
+  # Refit on training fold — reuse your model's formula/priors/family
+  fit_k <- update(
+    fit_full,                     # or fit_fs_ar_interact, whichever you're comparing
+    newdata = train_k,
+    chains = 1,
+    cores = 1,
+    iter = 2000,
+    warmup = 1000,
+    control = list(adapt_delta = 0.99, max_treedepth = 12),  # bumped up given divergence issue
+    seed = 123
+  )
+  
+  # Check divergences for THIS fold explicitly — don't silently trust it
+  div <- rstan::get_num_divergent(fit_k$fit)  # or check via nuts_params(fit_k) if cmdstanr backend
+  cat("Divergent transitions:", div, "\n")
+  
+  # Predict on held-out fold.
+  # IMPORTANT: held-out series have NO history in train_k, so ar() has nothing 
+  # to condition on for them — brms will effectively treat them as fresh series 
+  # (AR contribution ~0 at the start of an unseen group), which is the expected/
+  # correct behavior for genuinely out-of-sample series, not a bug to fix.
+  pred_k <- posterior_predict(fit_k, newdata = test_k, allow_new_levels = TRUE)
+  
+  # allow_new_levels=TRUE needed since test_k's colonies weren't necessarily
+  # all present in train_k depending on how series_id relates to colony —
+  # double check: are colonies split across folds, or fully held out? See note below.
+  
+  pred_mean <- colMeans(pred_k)
+  rmse_k <- sqrt(mean((pred_mean - log(test_k$track_90q_count))^2))
+  
+  cv_results[[k]] <- list(fit = fit_k, rmse = rmse_k, divergences = div)
+  
+  saveRDS(fit_k, paste0("./Models/fit_full_cv_fold_", k, ".rds"))  # checkpoint each fold
+}
+
+# Summarize
+rmse_all <- sapply(cv_results, function(x) x$rmse)
+div_all  <- sapply(cv_results, function(x) x$divergences)
+
+data.frame(fold = 1:K, rmse = rmse_all, divergences = div_all)
+mean(rmse_all)
+```
+
+## Check for spatial autocorrelation
+
+```{r}
+library(ape)
+fit = readRDS("./Models/fs_ar.rds")
+
+colony_resid <- track_df |>
+  mutate(resid = residuals(fit)[, "Estimate"]) |>
+  group_by(colony) |>
+  summarise(mean_resid = mean(resid, na.rm = TRUE),
+            ctr_lon = first(ctr_lon), ctr_lat = first(ctr_lat))
+
+dist_mat <- as.matrix(dist(colony_resid[, c("ctr_lon","ctr_lat")]))
+inv_dist <- 1 / dist_mat
+diag(inv_dist) <- 0
+
+Moran.I(colony_resid$mean_resid, inv_dist)
+# no statistically significant spatial autocorrelation in your colony-level mean residuals ($p = 0.745)
+```
+
+## Conditional smooths figure
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+# Turn off scientific notation globally
+options(scipen = 999)
+```
+
+```{r}
+fit <- readRDS("./Models/fs_ar.rds")   # your selected "fit_full"
+track_df <- read_csv("./Data/track_df.csv")
+ 
+# response is modeled as log(track_90q_count); back-transform to bat counts
+# for plotting on the original scale to match the reference figure.
+ 
+## ============================================================
+## 1. CONDITIONAL SMOOTHS PANEL FIGURE (styled like reference image)
+## ============================================================
+ 
+# --- 1a. Extract conditional smooths for all 1D smooth terms ---
+# conditional_smooths() returns one data frame per smooth, each already
+# containing estimate__, lower__, upper__ on the LINK scale (log here).
+cs <- conditional_smooths(fit, method = "fitted")
+ 
+smooth_names <- names(cs)
+print(smooth_names)   # confirm term names before building panels
+
+# --- Generalized full-scale panel builder, matching the roost_type approach ---
+
+# build_reference_template <- function(fit, data, n_points = 100) {
+#   num_cols <- names(data)[sapply(data, is.numeric)]
+#   template <- data[1, , drop = FALSE]
+#   for (col in num_cols) {
+#     template[[col]] <- median(data[[col]], na.rm = TRUE)
+#   }
+#   template
+# }
+# 
+# make_full_effect_panel <- function(fit, data, xvar, xlab, n_points = 100) {
+#   template <- build_reference_template(fit, data)
+# 
+#   x_seq <- seq(min(data[[xvar]], na.rm = TRUE),
+#                max(data[[xvar]], na.rm = TRUE),
+#                length.out = n_points)
+# 
+#   newdata <- template %>%
+#     select(-all_of(xvar)) %>%
+#     slice(rep(1, n_points)) %>%
+#     mutate(!!xvar := x_seq,
+#            local_date = seq_len(n()))   # dummy, since AR term is excluded below
+# 
+#   preds <- fitted(
+#     fit,
+#     newdata = newdata,
+#     re_formula = NA,        # exclude (1|colony), (1|year)
+#     incl_autocor = FALSE,   # exclude AR(1) contribution
+#     scale = "linear"        # link scale; exponentiate manually for consistency
+#   )
+# 
+#   plot_df <- newdata %>%
+#     mutate(
+#       estimate__ = exp(preds[, "Estimate"]),
+#       lower__    = exp(preds[, "Q2.5"]),
+#       upper__    = exp(preds[, "Q97.5"])
+#     )
+# 
+#   ggplot(plot_df, aes(x = .data[[xvar]], y = estimate__)) +
+#     geom_line(linewidth = 0.6) +
+#     geom_line(aes(y = lower__), linetype = "dashed", linewidth = 0.4) +
+#     geom_line(aes(y = upper__), linetype = "dashed", linewidth = 0.4) +
+#     geom_rug(data = data, aes(x = .data[[xvar]], y = NULL),
+#              sides = "b", alpha = 0.3, inherit.aes = FALSE) +
+#     labs(x = xlab, y = "Predicted emergence count") +
+#     theme_classic(base_size = 10)
+# }
+# 
+# panel_list <- list(
+#   A = make_full_effect_panel(fit, track_df, "air.2m.night",      "Air temperature (K)"),
+#   B = make_full_effect_panel(fit, track_df, "pres.sfc.night",    "Surface pressure"),
+#   C = make_full_effect_panel(fit, track_df, "rhum_resid",        "Relative humidity (residual)"),
+#   D = make_full_effect_panel(fit, track_df, "tcdc.night",        "Total cloud cover (%)"),
+#   E = make_full_effect_panel(fit, track_df, "wind_speed.night",  "Wind speed (m/s)"),
+#   F = make_full_effect_panel(fit, track_df, "prate.night",       "Precipitation rate"),
+#   G = make_full_effect_panel(fit, track_df, "avg_drought_index", "Palmer drought index"),
+#   H = make_full_effect_panel(fit, track_df, "air.2m.night.diff", "Night air temp difference (K)"),
+#   I = make_full_effect_panel(fit, track_df, "from_sunset",       "Time from sunset (mins)"),
+#   J = make_full_effect_panel(fit, track_df, "lunar.illumination","Lunar illumination"),
+#   K = make_full_effect_panel(fit, track_df, "yday",              "Day of year"),
+#   L = make_full_effect_panel(fit, track_df, "avg_3day_prior",    "Previous 3-night avg count")
+# )
+
+# --- 1b. Helper to build one panel matching the reference style:
+#   solid line, dashed CI, rug marks on x-axis, back-transformed to count scale ---
+make_smooth_panel <- function(cs_obj, xvar, xlab, raw_data_col = NULL) {
+  # Find the matching slot in cs containing the variable name
+  matched_name <- grep(paste0("\\b", xvar, "\\b"), names(cs_obj), value = TRUE)
+  
+  if (length(matched_name) == 0) {
+    stop(paste("No smooth found matching variable:", xvar))
+  }
+  
+  cs_df <- cs_obj[[matched_name[1]]]
+  cs_df <- cs_df %>%
+    mutate(
+      estimate_bt = exp(estimate__),
+      lower_bt    = exp(lower__),
+      upper_bt    = exp(upper__)
+    )
+ 
+  p <- ggplot(cs_df, aes(x = .data[[xvar]], y = estimate_bt)) +
+    geom_line(linewidth = 0.6) +
+    geom_line(aes(y = lower_bt), linetype = "dashed", linewidth = 0.4) +
+    geom_line(aes(y = upper_bt), linetype = "dashed", linewidth = 0.4) +
+    labs(x = xlab, y = "Partial effect") +
+    theme_classic(base_size = 10) +
+    theme(plot.title = element_blank())
+ 
+  # add rug marks from the raw covariate distribution, as in the reference figure
+  if (!is.null(raw_data_col)) {
+    p <- p + geom_rug(
+      data = track_df, aes(x = .data[[raw_data_col]], y = NULL),
+      sides = "b", alpha = 0.3, inherit.aes = FALSE
+    )
+  }
+  p
+}
+ 
+# --- 1c. Build each panel; MAP your actual smooth term names here.
+# Names will look like "mu_air.2m.night" etc. depending on your formula —
+# check `smooth_names` output above and adjust the list below accordingly.
+ 
+panel_list <- list(
+  A = make_smooth_panel(cs, "air.2m.night",       "Air temperature (K)",            "air.2m.night"),
+  B = make_smooth_panel(cs, "pres.sfc.night",      "Surface pressure",               "pres.sfc.night"),
+  C = make_smooth_panel(cs, "rhum_resid",          "Relative humidity (residual)",   "rhum_resid"),
+  D = make_smooth_panel(cs, "tcdc.night",          "Total cloud cover (%)",          "tcdc.night"),
+  E = make_smooth_panel(cs, "wind_speed.night",    "Wind speed (m/s)",               "wind_speed.night"),
+  F = make_smooth_panel(cs, "prate.night",         "Precipitation rate",             "prate.night"),
+  H = make_smooth_panel(cs, "air.2m.night.diff",   "Night air temp difference (K)",  "air.2m.night.diff"),
+  I = make_smooth_panel(cs, "avg_drought_index",   "Palmer drought index",           "avg_drought_index"),
+  J = make_smooth_panel(cs, "from_sunset",         "Time from sunset (mins)",        "from_sunset"),
+  K = make_smooth_panel(cs, "lunar.illumination",  "Lunar illumination",             "lunar.illumination"),
+  L = make_smooth_panel(cs, "yday",                "Day of year",                    "yday"),
+  M = make_smooth_panel(cs, "avg_3day_prior",      "Previous 3-night avg count",     "avg_3day_prior")
+)
+ 
+# --- 1d. Roost type — categorical, point-range panel (like reference panel N) ---
+roost_levels <- unique(fit$data$roost_type)
+template <- fit$data[1, , drop = FALSE]
+
+num_cols <- names(fit$data)[sapply(fit$data, is.numeric)]
+for (col in num_cols) {
+  template[[col]] <- median(fit$data[[col]], na.rm = TRUE)
+}
+
+new_roost <- template %>%
+  select(-roost_type) %>%
+  crossing(roost_type = roost_levels) %>%
+  mutate(local_date = seq_len(n()))
+
+preds <- fitted(
+  fit,
+  newdata = new_roost,
+  re_formula = NA,
+  incl_autocor = FALSE, 
+  scale = "linear" # Link scale, so we can manually exp() it next
+)
+
+roost_ce <- new_roost %>%
+  mutate(
+    estimate__ = exp(preds[, "Estimate"]),
+    lower__    = exp(preds[, "Q2.5"]),
+    upper__    = exp(preds[, "Q97.5"])
+  )
+ 
+panel_roost <- ggplot(roost_ce, aes(x = roost_type, y = estimate__)) +
+  geom_pointrange(aes(ymin = lower__, ymax = upper__)) +
+  labs(x = "Roost type", y = "Emergence size") +
+  theme_classic(base_size = 10)
+ 
+# --- 1e. Spatial (colony location) — contour/heat panel like reference panel O.
+# If you added gp(ctr_lon, ctr_lat), extract via conditional_smooths on that term;
+# otherwise, approximate using colony-level mean fitted values plotted spatially.
+ 
+colony_fitted <- track_df %>%
+  mutate(fitted_val = exp(fitted(fit)[, "Estimate"])) %>%
+  group_by(colony, ctr_lon, ctr_lat) %>%
+  summarise(mean_fitted = mean(fitted_val), .groups = "drop")
+ 
+# Determine the maximum value rounded up to a clean cutoff
+max_val <- ceiling(max(colony_fitted$mean_fitted, na.rm = TRUE) / 100000) * 100000
+break_vals <- seq(100000, max_val, by = 100000)
+
+panel_spatial <- ggplot(colony_fitted, aes(x = ctr_lon, y = ctr_lat)) +
+  geom_point(aes(color = mean_fitted, size = mean_fitted)) +
+  scale_color_viridis_c(
+    limits = c(min(colony_fitted$mean_fitted, na.rm = TRUE), max_val),
+    breaks = break_vals,
+    name = "Predicted mean daily emergence size",
+    guide = guide_legend(nrow = 1) # Forces color to merge with the size legend
+  ) +
+  scale_size_continuous(
+    limits = c(min(colony_fitted$mean_fitted, na.rm = TRUE), max_val),
+    breaks = break_vals,
+    name = "Predicted mean daily emergence size" # Must match the color name exactly
+  ) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "bottom")
+# NOTE: this is a discrete colony-level scatter, not a smoothed spatial surface.
+# If you added a gp() term, a smoother contour can be built by predicting fit
+# over a fine lon/lat grid instead — ask if you'd like that version.
+ 
+## --- Assemble full panel grid, matching reference figure layout ---
+final_panel <- wrap_plots(
+  c(panel_list, list(N_roost = panel_roost, O_spatial = panel_spatial)),
+  ncol = 4,
+  byrow = FALSE) +
+  plot_annotation(tag_levels = "A")
+ 
+ggsave("./Figures/full_fs_ar_model_panel.pdf", final_panel,
+       width = 16, height = 12, dpi = 300)
 ```
 
 # BAM
@@ -351,4 +789,270 @@ concurvity(m_ar, full = TRUE)
 gam.check(m_ar)
 ```
 
-# 
+# Xgboost
+
+exploratory pipeline using xgboost for predictive benchmarking plus iml's H-statistic for interaction detection
+
+```{r}
+library(xgboost)
+library(iml)
+library(recipes)
+library(ggplot2)
+
+# ============================================================
+# 1. Prep data — grouped train/test split to respect structure
+# ============================================================
+# Split by series_id (not random rows) so temporal blocks stay intact,
+# matching the CV approach used for the brms comparison — this keeps
+# the RF/xgboost benchmark honest and comparable to the brms kfold results.
+
+set.seed(123)
+series_ids <- unique(track_df$series_id)
+test_series <- sample(series_ids, size = round(0.2 * length(series_ids)))
+
+train_df <- track_df |> filter(!series_id %in% test_series)
+test_df  <- track_df |> filter(series_id %in% test_series)
+
+# Predictor set — same environmental drivers as the brms model,
+# excluding IDs/dates/response and anything that would leak (e.g., track_count_se)
+predictor_vars <- c(
+  "roost_type", "avg_3day_prior", "air.2m.night", "air.2m.night.diff",
+  "wind_speed.night", "prate.night", "rhum_resid", "pres.sfc.night",
+  "tcdc.night", "lunar.illumination", "avg_drought_index", "yday", "dist", "from_sunset"
+)
+
+# xgboost needs numeric matrices — one-hot encode roost_type
+rec <- recipe(~ ., data = train_df[, predictor_vars]) |>
+  step_dummy(roost_type, one_hot = TRUE) |>
+  prep()
+
+train_x <- bake(rec, new_data = train_df[, predictor_vars]) |> as.matrix()
+test_x  <- bake(rec, new_data = test_df[, predictor_vars]) |> as.matrix()
+
+train_y <- log(train_df$track_90q_count)   # match response scale used in brms model
+test_y  <- log(test_df$track_90q_count)
+
+dtrain <- xgb.DMatrix(data = train_x, label = train_y)
+dtest  <- xgb.DMatrix(data = test_x, label = test_y)
+
+# ============================================================
+# 2. Tune via CV (lightweight grid — expand if compute allows)
+# ============================================================
+param_grid <- expand.grid(
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.05, 0.1),
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+cv_results <- purrr::pmap_dfr(param_grid, function(max_depth, eta, subsample, colsample_bytree) {
+  params <- list(
+    objective = "reg:squarederror",
+    max_depth = max_depth,
+    eta = eta,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree
+  )
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    nfold = 5,
+    early_stopping_rounds = 30,
+    verbose = 0
+  )
+  tibble(
+    max_depth = max_depth, eta = eta,
+    best_iter = cv$best_iteration,
+    best_rmse = min(cv$evaluation_log$test_rmse_mean)
+  )
+})
+
+cv_results |> arrange(best_rmse)
+best_params <- cv_results |> arrange(best_rmse) |> slice(1)
+best_params
+
+# ============================================================
+# 3. Fit final model with best hyperparameters
+# ============================================================
+# Safely handle the best rounds variable (it's usually 'best_iteration' from xgb.cv)
+nrounds_val <- if (!is.null(best_params$best_iter)) {
+  best_params$best_iter
+} else if (!is.null(best_params$best_iteration)) {
+  best_params$best_iteration
+} else {
+  500 # fallback if neither exists
+}
+
+final_params <- list(
+  objective = "reg:squarederror",
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_fit <- xgb.train(
+  params = final_params,
+  data = dtrain,
+  nrounds = nrounds_val,
+  evals = list(train = dtrain, test = dtest),  # Updated from watchlist to evals
+  print_every_n = 50
+)
+
+# ============================================================
+# 4. Predictive performance — this is your RF/xgboost benchmark number
+# ============================================================
+pred_test <- predict(xgb_fit, dtest)
+
+rmse <- sqrt(mean((pred_test - test_y)^2))
+mae  <- mean(abs(pred_test - test_y))
+r2   <- cor(pred_test, test_y)^2
+
+cat("Held-out (series-grouped) performance:\n")
+cat("RMSE:", round(rmse, 4), "\n")
+cat("MAE: ", round(mae, 4), "\n")
+cat("R2:  ", round(r2, 4), "\n")
+
+# This R2/RMSE, on the SAME held-out series_id folds, is what you compare
+# against brms kfold() results — apples-to-apples on temporally honest splits.
+
+# ============================================================
+# 5. Variable importance
+# ============================================================
+importance_matrix <- xgb.importance(model = xgb_fit)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix, top_n = 15)
+```
+
+Interaction detection with iml
+
+iml needs a Predictor wrapper and works on a data frame (not the xgboost matrix directly), so reconstruct a clean data frame with matching columns:
+
+```{r}
+# ============================================================
+# 6. Set up iml Predictor object
+# ============================================================
+# iml needs a data.frame of predictors + a prediction function.
+# Use a manageable subsample for interaction analysis — H-statistic
+# computation is O(n) per pair and gets slow fast on 20k+ rows.
+
+set.seed(123)
+iml_sample <- train_df[sample(nrow(train_df), min(2000, nrow(train_df))), predictor_vars]
+
+# Predict function must replicate the exact preprocessing (dummy encoding) used in training
+predict_fn <- function(model, newdata) {
+  newdata_baked <- bake(rec, new_data = newdata) |> as.matrix()
+  predict(model, newdata_baked)
+}
+
+predictor <- Predictor$new(
+  model = xgb_fit,
+  data = iml_sample,
+  y = log(train_df$track_90q_count[sample(nrow(train_df), min(2000, nrow(train_df)))]),
+  predict.function = predict_fn
+)
+
+# ============================================================
+# 7. Overall interaction strength per variable (H-statistic, 1-way)
+# ============================================================
+# This tells you WHICH variables are most involved in interactions overall,
+# before testing specific pairs — a good triage step since testing every
+# pairwise combination (13 choose 2 = 78 pairs) is expensive.
+
+interact_overall <- Interaction$new(predictor)
+plot(interact_overall)
+
+interact_overall_df <- interact_overall$results |> arrange(desc(.interaction))
+print(interact_overall_df)
+
+# ============================================================
+# 8. Pairwise H-statistic for top-flagged variables
+# ============================================================
+# Take the top 4-5 variables from step 7 and test all pairs among them,
+# rather than all 78 possible pairs — keeps this tractable.
+
+top_vars <- interact_overall_df$.feature[1:5]
+top_vars
+
+pairwise_results <- list()
+for (v in top_vars) {
+  interact_2way <- Interaction$new(predictor, feature = v)
+  pairwise_results[[v]] <- interact_2way$results |> arrange(desc(.interaction))
+}
+
+# Combine into one summary table
+pairwise_summary <- bind_rows(pairwise_results, .id = "anchor_var") |>
+  arrange(desc(.interaction))
+
+print(pairwise_summary)
+
+# ============================================================
+# 9. Visualize the strongest flagged pair(s) with 2D partial dependence
+# ============================================================
+# Pick top 2-3 pairs from pairwise_summary and inspect their PDP surface
+# to see the SHAPE of the interaction (this informs how to specify t2()/ti()
+# in the brms model — e.g., is it a simple threshold interaction, or genuinely
+# smooth/curved non-additive structure?)
+
+top_pair <- c(pairwise_summary$anchor_var[1], pairwise_summary$.feature[1])
+top_pair
+
+pdp_2way <- FeatureEffect$new(
+  predictor, 
+  feature = c("pres.sfc.night", "roost_type"), 
+  method = "pdp"
+)
+pdp_2way$plot()
+
+
+pdp_2way_2 <- FeatureEffect$new(predictor, feature = c("pres.sfc.night","air.2m.night"), method = "pdp")
+pdp_2way_2$plot()
+
+# ============================================================
+# 10. Single-variable PDPs for the top individual predictors
+# ============================================================
+# Compare shapes against your brms smooth term shapes — similar nonlinear
+# patterns here vs. in conditional_smooths(fit) is a good cross-validation
+# that both modeling approaches are picking up the same underlying signal.
+
+for (v in importance_matrix$Feature[1:6]) {
+  pdp_1way <- FeatureEffect$new(predictor, feature = v, method = "pdp")
+  print(plot(pdp_1way) + ggtitle(paste("PDP:", v)))
+}
+
+m_add <- bam(log(track_90q_count) ~ s(air.2m.night) +
+    s(air.2m.night.diff) +
+    s(wind_speed.night, k = 12) +
+    s(prate.night)+
+    s(rhum_resid) +
+    s(pres.sfc.night) +
+    s(tcdc.night) +
+    s(lunar.illumination, k = 15) +
+    s(avg_drought_index) +
+    roost_type +
+    s(dist) +
+    s(from_sunset) +
+    s(yday), 
+    data = track_df, method = "fREML")
+m_int <- bam(log(track_90q_count) ~ s(air.2m.night) +
+    s(air.2m.night.diff) +
+    s(wind_speed.night, k = 12) +
+    s(prate.night)+
+    s(rhum_resid) +
+    s(pres.sfc.night) +
+    s(tcdc.night) +
+    s(lunar.illumination, k = 15) +
+    s(avg_drought_index) +
+    roost_type +
+    s(dist) +
+    s(from_sunset) +
+    s(avg_3day_prior) +
+    s(yday)+
+    s(pres.sfc.night, by = roost_type, k = 10), 
+    data = track_df, method = "fREML")
+
+AIC(m_add, m_int)
+
+# so we should add the interaction term of pres.sfc.night x roost_type
+```
