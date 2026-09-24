@@ -257,30 +257,47 @@ library(brms)
 
 track_df = read_csv("./Data/track_df.csv")
 
-bf_model <- bf(
-  log(track_90q_count) ~
-    s(air.2m.night) +
-    s(air.2m.night.diff) +
-    s(wind_speed.night, k = 12) +
-    s(prate.night)+
-    s(rhum_resid) +
-    s(pres.sfc.night) +
-    s(tcdc.night) +
-    s(lunar.illumination, k = 15) +
-    s(avg_drought_index) +
-    roost_type +
-    s(dist) +
-    s(from_sunset) +
-    s(avg_3day_prior) +
-    s(yday, bs = "cc") +
-    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) +
-    (1 | colony) +
-    (1 | year) +
+# base model
+base = bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + (1 | colony) + (1 | year) 
+)
+
+# AR(1) only model
+ar_only = bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + (1 | colony) + (1 | year) + 
+    ar(time = local_date, gr = series_id, p = 1) 
+)
+
+# random slope + AR(1) model
+# captures colony-specific linear pattern changes rather than fully flexible nonlinear ones
+ranslope_ar = bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night, k = 10) + s(pres.sfc.night, by = roost_type, k = 10, m = 1) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + 
+    (1 + yday | colony) + (1 | year) + 
+    ar(time = local_date, gr = series_id, p = 1) 
+)
+
+# factor-smooth only model
+fs_only = bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + 
+    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) + 
+    (1 | colony) + (1 | year) 
+)
+
+# full model
+fs_ar <- bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + 
+    s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) + 
+    (1 | colony) + (1 | year) + 
     ar(time = local_date, gr = series_id, p = 1)
 )
 
+# full model + interaction
+fs_ar_interact = bf(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) + s(wind_speed.night, k = 12) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night, k = 10) + s(pres.sfc.night, by = roost_type, k = 10, m = 1) + s(tcdc.night) + s(lunar.illumination, k = 15) + s(avg_drought_index) + roost_type + s(dist) + s(from_sunset) + s(avg_3day_prior) + s(yday, bs = "cc") + s(yday, colony, bs = "fs", xt = list(bs = "cc"), k = 8) + (1 | colony) + (1 | year) + ar(time = local_date, gr = series_id, p = 1) 
+)
+
 # Check what priors brms expects for this formula before fitting
-get_prior(bf_model, data = track_df, family = gaussian())
+get_prior(fs_ar, data = track_df, family = gaussian())
 
 priors <- c(
   prior(normal(0, 5), class = "b"),                 # fixed effects (roost_type)
@@ -298,7 +315,7 @@ library(cmdstanr)
 dir.create("./Models/csvs", showWarnings = FALSE, recursive = TRUE)
 
 fit <- brm(
-  bf_model,
+  fs_ar,
   data = track_df,
   family = gaussian(),
   prior = priors,
@@ -596,9 +613,7 @@ make_smooth_panel <- function(cs_obj, xvar, xlab, raw_data_col = NULL) {
   p
 }
  
-# --- 1c. Build each panel; MAP your actual smooth term names here.
-# Names will look like "mu_air.2m.night" etc. depending on your formula —
-# check `smooth_names` output above and adjust the list below accordingly.
+# --- 1c. Build each panel; MAP actual smooth term names here.
  
 panel_list <- list(
   A = make_smooth_panel(cs, "air.2m.night",       "Air temperature (K)",            "air.2m.night"),
@@ -615,7 +630,7 @@ panel_list <- list(
   M = make_smooth_panel(cs, "avg_3day_prior",      "Previous 3-night avg count",     "avg_3day_prior")
 )
  
-# --- 1d. Roost type — categorical, point-range panel (like reference panel N) ---
+# --- 1d. Roost type — categorical, point-range panel ---
 roost_levels <- unique(fit$data$roost_type)
 template <- fit$data[1, , drop = FALSE]
 
