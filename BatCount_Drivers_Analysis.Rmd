@@ -13,6 +13,9 @@ library(mgcv)
 library(dplyr)
 library(lubridate)
 library(tidyverse)
+library(sf)
+library(ggplot2)
+library(maps)
 ```
 
 # Data wrangling
@@ -65,6 +68,47 @@ df |>
   filter(n_distinct_temp > 1)
 
 hist(df$n_tracks)
+
+
+
+stations <- read_csv("Data/stations.csv") |> filter(station %in% c("KEWX", "KGRK", "KSJT", "KDFX"))
+stations_sf <- st_as_sf(stations, coords = c("longitude", "latitude"), crs = 4326) |>
+  st_transform(6933)
+radar_buffers <- st_buffer(stations_sf, dist = 150000)
+colony_sf <- st_as_sf(df_colony, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+texas_sf <- st_as_sf(map("state", plot = FALSE, fill = TRUE)) |>
+  subset(ID == "texas") |>
+  st_transform(6933)
+bbox <- st_bbox(colony_sf)
+
+ggplot() +
+  # Texas Base Map
+  geom_sf(data = texas_sf, fill = "gray95", color = "gray50") +
+  # radar stations
+  geom_sf(data = radar_buffers, fill = NA, color = "grey9", linetype = "dashed", linewidth = 0.3) +
+  geom_sf(data = stations_sf, shape = 1, size = 2, color = "grey9", alpha = 0.8) +
+  # Bat Colonies
+  geom_sf(data = colony_sf, aes(color = roost_type, shape = roost_type), size = 3, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "natural" = "#22A884FF", 
+    "anthropogenic" = "#2A788EFF", 
+    "unknown" = "#440154FF"
+  )) +
+  coord_sf(
+    xlim = c(bbox["xmin"] - 100000, bbox["xmax"] + 100000), 
+    ylim = c(bbox["ymin"] - 100000, bbox["ymax"] + 120000),
+    expand = FALSE
+  ) +
+  theme_minimal() +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    color = "Roost Type",
+    shape = "Roost Type"
+  ) +
+  theme(legend.position = "bottom")
+
+ggsave("./Figures/roosts_map.pdf", width = 5, height = 5)
 ```
 
 Addtionally (not done yet), I could consider whether n_tracks (how many radar tracks contributed to each night's 90th percentile) should enter the model. A 90th percentile computed from 3 tracks is a much noisier estimate of "true" nightly emergence intensity than one computed from 50 tracks. This is exactly what track_count_se was meant to capture, but I could also:
@@ -82,7 +126,8 @@ mean(dist(df_colony[, c("ctr_lon", "ctr_lat")])) / 1000
 
 ## The 3-Day Rolling Average
 
-Test compensatory foraging: bats "penned up" by bad weather will emerge in much higher intensity on subsequent nights.
+Test compensatory foraging: bats "penned up" by bad weather will emerge in much higher intensity on subsequent nights. 
+series_id: a continuous, uninterrupted sequence of nights for a single colony. Every time there is a data gap of more than one day (time_diff > 1), bout_id increments, creating a brand new series_id.
 
 ```{r}
 library(slider)
@@ -171,20 +216,50 @@ cor(track_df$rhum.2m.night, track_df$prate.night.diff, use = "complete.obs")
 cor(track_df$prate.night, track_df$avg_3day_prior, use = "complete.obs")
 
 quick_check <- bam(
-  log(track_90q_count) ~ s(rhum.2m.night) + s(prate.night) + s(prate.night.diff) + s(pres.sfc.night),
+  log(track_90q_count) ~
+    s(air.2m.night) + s(air.2m.night.diff) +
+    s(wind_speed.night) + s(prate.night) + s(rhum_resid) + s(pres.sfc.night) +
+    s(tcdc.night) + s(lunar.illumination) + s(avg_drought_index) +
+    s(from_sunset) + s(dist) + s(avg_3day_prior) +
+    s(yday, bs = "cc") +
+    roost_type +
+    s(colony, bs = "re") + s(year, bs = "re"),
   data = track_df, method = "fREML", discrete = TRUE
 )
-concurvity(quick_check, full = FALSE)
+
+# Overview: one value per term (how well is each term predicted by ALL the others?)
+conc_full <- concurvity(quick_check, full = TRUE)
+round(conc_full$observed, 2)
+round(conc_full$estimate, 2)
+
+# Pairwise: identifies WHICH terms are the partners
+conc_pair <- concurvity(quick_check, full = FALSE)
+obs <- conc_pair$observed
+obs[upper.tri(obs, diag = TRUE)] <- NA
+idx <- which(obs > 0.7, arr.ind = TRUE)
+data.frame(term1 = rownames(obs)[idx[, 1]],
+           term2 = colnames(obs)[idx[, 2]],
+           concurvity = obs[idx])
+
+quick_check <- bam(
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) +
+    s(wind_speed.night) + 
+    s(rhum.2m.night) + s(pres.sfc.night) + s(prate.night) + 
+    s(tcdc.night) + s(lunar.illumination) + s(avg_drought_index) + 
+    s(from_sunset) + s(dist) + s(avg_3day_prior) + s(yday) + roost_type,
+  data = track_df, method = "fREML", discrete = TRUE
+)
+concurvity(quick_check, full = F)
 
 resid_model <- bam(rhum.2m.night ~ s(prate.night), data = track_df, method = "fREML")
 track_df$rhum_resid <- residuals(resid_model)
 
 quick_check <- bam(
-  log(track_90q_count) ~ s(avg_3day_prior) + s(air.2m.night) + s(air.2m.night.diff) +
+  log(track_90q_count) ~ s(air.2m.night) + s(air.2m.night.diff) +
     s(wind_speed.night) + 
     s(rhum_resid) + s(pres.sfc.night) + s(prate.night) + 
     s(tcdc.night) + s(lunar.illumination) + s(avg_drought_index) + 
-    roost_type + s(from_sunset) + s(dist),
+    s(from_sunset) + s(dist) + s(avg_3day_prior) + s(yday) + roost_type,
   data = track_df, method = "fREML", discrete = TRUE
 )
 concurvity(quick_check, full = TRUE) # HIGH Concurvity, drop prate.night.diff
@@ -383,84 +458,51 @@ saveRDS(loo_fs_ar_interact, "./Models/loo_fs_ar_interact.rds")
 saveRDS(loo_ranslope, "./Models/loo_ranslope.rds")
 ```
 
-A pareto_k \> 0.7 means PSIS-LOO's importance sampling approximation is unreliable for that specific observation in fit_fs and fit_full — the elpd contribution from that one point could be biased, which could specifically affect exactly the comparison you care about (full vs. fs).
+## K-fold
+
+k_psis > 0.7 means PSIS-LOO's importance sampling approximation is unreliable for that specific observation in fit_fs and fit_full — the elpd contribution from that one point could be biased, which could specifically affect exactly the comparison you care about (full vs. fs).
 
 blocked/grouped k-fold CV — hold out entire series_id blocks (whole colony-seasons) rather than individual nights, so temporal dependency within a held-out block stays intact and prediction is genuinely out-of-sample:
 
 ```{r}
-library(brms)
+options(future.globals.maxSize = 3 * 1024^3)
+kfold_cv <- kfold(fit_full, K = 5, folds = "grouped", group = "series_id")
+```
+
+```{r}
 library(dplyr)
+library(brms)
+library(Metrics) # for rmse, mae
 
-# --- Fix 1: convert local_date to numeric BEFORE fitting, avoids Date-class
-# metadata mismatches in ar() validation entirely ---
-track_df <- track_df |>
-  mutate(local_date_num = as.numeric(local_date))  # days since epoch, numeric
-
-# Refit your candidate models using local_date_num in ar(), e.g.:
-# ar(time = local_date_num, gr = series_id, p = 1)
-# (If you don't want to refit fit_full/fit_fs_ar_interact from scratch, you can 
-#  likely get away with just using local_date_num for the CV refits below, since 
-#  what matters for THIS check is that newdata construction stays consistent.)
-
-# --- Manual grouped K-fold ---
+# 1. Create a blocked split (e.g., hold out 20% of series_ids)
 set.seed(123)
-series_ids <- unique(track_df$series_id)
-K <- 5   # reduced from 10 — cuts total compute roughly in half; consider even 
-         # fewer folds given the runtime you're seeing
-folds <- sample(rep(1:K, length.out = length(series_ids)))
-fold_map <- setNames(folds, series_ids)
-track_df$fold <- fold_map[as.character(track_df$series_id)]
+all_series <- unique(track_df$series_id)
+test_series <- sample(all_series, size = length(all_series) * 0.2)
 
-# Storage for results
-cv_results <- vector("list", K)
+train_df <- track_df |> filter(!series_id %in% test_series)
+test_df  <- track_df |> filter(series_id %in% test_series)
 
-for (k in 1:K) {
-  cat("=== Fold", k, "of", K, "===\n")
-  
-  train_k <- track_df |> filter(fold != k)
-  test_k  <- track_df |> filter(fold == k)
-  
-  # Refit on training fold — reuse your model's formula/priors/family
-  fit_k <- update(
-    fit_full,                     # or fit_fs_ar_interact, whichever you're comparing
-    newdata = train_k,
-    chains = 1,
-    cores = 1,
-    iter = 2000,
-    warmup = 1000,
-    control = list(adapt_delta = 0.99, max_treedepth = 12),  # bumped up given divergence issue
-    seed = 123
+# 2. Refit the model on the training data 
+# (using update() is faster as it avoids recompiling the Stan code)
+fit_train <- update(fit_full, newdata = train_df)
+
+# 3. Predict on the hold-out test set
+# allow_new_levels = TRUE is necessary if any colonies in the test set weren't in the train set
+preds <- predict(fit_train, newdata = test_df, allow_new_levels = TRUE)
+
+# predict() returns a matrix with Estimate, Est.Error, Q2.5, Q97.5
+test_df$pred_log_count <- preds[, "Estimate"]
+
+# 4. Exponentiate back to original scale for ML evaluation
+test_df <- test_df |> 
+  mutate(
+    pred_count = exp(pred_log_count),
+    obs_count = track_90q_count
   )
-  
-  # Check divergences for THIS fold explicitly — don't silently trust it
-  div <- rstan::get_num_divergent(fit_k$fit)  # or check via nuts_params(fit_k) if cmdstanr backend
-  cat("Divergent transitions:", div, "\n")
-  
-  # Predict on held-out fold.
-  # IMPORTANT: held-out series have NO history in train_k, so ar() has nothing 
-  # to condition on for them — brms will effectively treat them as fresh series 
-  # (AR contribution ~0 at the start of an unseen group), which is the expected/
-  # correct behavior for genuinely out-of-sample series, not a bug to fix.
-  pred_k <- posterior_predict(fit_k, newdata = test_k, allow_new_levels = TRUE)
-  
-  # allow_new_levels=TRUE needed since test_k's colonies weren't necessarily
-  # all present in train_k depending on how series_id relates to colony —
-  # double check: are colonies split across folds, or fully held out? See note below.
-  
-  pred_mean <- colMeans(pred_k)
-  rmse_k <- sqrt(mean((pred_mean - log(test_k$track_90q_count))^2))
-  
-  cv_results[[k]] <- list(fit = fit_k, rmse = rmse_k, divergences = div)
-  
-  saveRDS(fit_k, paste0("./Models/fit_full_cv_fold_", k, ".rds"))  # checkpoint each fold
-}
 
-# Summarize
-rmse_all <- sapply(cv_results, function(x) x$rmse)
-div_all  <- sapply(cv_results, function(x) x$divergences)
-
-data.frame(fold = 1:K, rmse = rmse_all, divergences = div_all)
-mean(rmse_all)
+# 5. Calculate ML-style metrics
+out_of_sample_rmse <- rmse(test_df$obs_count, test_df$pred_count)
+out_of_sample_mae <- mae(test_df$obs_count, test_df$pred_count)
 ```
 
 ## Check for spatial autocorrelation
